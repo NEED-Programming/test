@@ -71,7 +71,7 @@ CONFIG = {
     },
 }
 
-STAGES = ["dnsx", "tlsx", "naabu", "nmap", "httpx", "nuclei"]
+STAGES = ["dnsx", "tlsx", "naabu", "nmap", "httpx"]
 
 
 # --------------------------------------------------------------------------- #
@@ -311,9 +311,10 @@ def first(d, *keys, default=None):
 # Stages. Each: build input from store -> run tool -> normalize into store.
 # --------------------------------------------------------------------------- #
 def stage_dnsx(store, rid, wd, scope):
-    out = os.path.join(wd, "dnsx.json")
-    run_tool([CONFIG["tools"]["dnsx"], "-l", scope, "-ptr", "-resp-only",
-              "-j", "-silent"], out)
+    out = os.path.join(wd, "ptr_hostnames.json")
+    # -j keeps the IP->name mapping the store needs; -resp-only would drop it.
+    run_tool([CONFIG["tools"]["dnsx"], "-l", scope, "-ptr",
+              "-j", "-silent", "-o", out])
     n = 0
     for o in jsonl(out):
         ip = first(o, "host", "ip")
@@ -329,9 +330,10 @@ def stage_dnsx(store, rid, wd, scope):
 
 
 def stage_tlsx(store, rid, wd, scope):
-    out = os.path.join(wd, "tlsx.json")
+    out = os.path.join(wd, "cert_names.json")
+    # -j keeps the IP->name mapping; -resp-only would drop it.
     run_tool([CONFIG["tools"]["tlsx"], "-l", scope, "-cn", "-san",
-              "-j", "-silent"], out)
+              "-j", "-silent", "-o", out])
     n = 0
     for o in jsonl(out):
         ip = first(o, "host", "ip")
@@ -354,9 +356,9 @@ def stage_tlsx(store, rid, wd, scope):
 
 
 def stage_naabu(store, rid, wd, scope):
-    out = os.path.join(wd, "naabu.json")
+    out = os.path.join(wd, "naabu_open.json")
     argv = [CONFIG["tools"]["naabu"], "-l", scope,
-            "-rate", str(CONFIG["naabu_rate"]), "-j", "-silent"]
+            "-rate", str(CONFIG["naabu_rate"]), "-j", "-silent", "-o", out]
     pc = CONFIG["naabu_ports"]
     if pc == "top-1000":
         argv += ["-top-ports", "1000"]
@@ -364,7 +366,7 @@ def stage_naabu(store, rid, wd, scope):
         argv += ["-p", "-"]
     else:
         argv += ["-p", pc]
-    run_tool(argv, out)
+    run_tool(argv)
     n = 0
     for o in jsonl(out):
         ip = first(o, "ip", "host")
@@ -392,11 +394,13 @@ def stage_nmap(store, rid, wd, scope):
     def scan(item):
         ip, ports = item
         plist = ",".join(str(p) for p in sorted(set(ports)))
-        xml = os.path.join(wd, f"nmap_{ip.replace(':', '_')}.xml")
+        base = os.path.join(wd, f"nmap_{ip.replace(':', '_')}")
+        # -oA writes .xml/.nmap/.gnmap; we parse the .xml, you keep the rest.
         argv = ([CONFIG["tools"]["nmap"]] + CONFIG["nmap_opts"]
-                + [CONFIG["nmap_timing"], "-p", plist, "-oX", xml, ip])
+                + [CONFIG["nmap_timing"], "--stats-every", "30s",
+                   "-p", plist, "-oA", base, ip])
         run_tool(argv)
-        return xml
+        return base + ".xml"
 
     with ThreadPoolExecutor(max_workers=CONFIG["nmap_workers"]) as pool:
         xmls = list(pool.map(scan, targets.items()))
@@ -451,15 +455,18 @@ def stage_httpx(store, rid, wd, scope):
     if not candidates:
         return "no web candidates"
 
-    infile = os.path.join(wd, "httpx_in.txt")
+    infile = os.path.join(wd, "web_candidates.txt")
     with open(infile, "w") as fh:
         fh.write("\n".join(sorted(candidates)))
 
     out = os.path.join(wd, "httpx.json")
+    # -screenshot needs a headless browser (add -system-chrome to use your
+    # installed Chrome); -esb keeps the screenshot base64 out of httpx.json.
     run_tool([CONFIG["tools"]["httpx"], "-l", infile, "-j", "-silent",
               "-sc", "-title", "-tech-detect", "-server",
+              "-screenshot", "-esb",
               "-threads", str(CONFIG["httpx_threads"]),
-              "-rate-limit", str(CONFIG["httpx_rate"])], out)
+              "-rate-limit", str(CONFIG["httpx_rate"]), "-o", out])
     n = 0
     for o in jsonl(out):
         url = first(o, "url")
