@@ -57,17 +57,12 @@ CONFIG = {
     "nmap_workers": 5,                # hosts scanned in parallel (subprocess only)
     "httpx_threads": 50,
     "httpx_rate": 150,                # requests/sec
-    "nuclei_severity": "low,medium,high,critical",  # drop 'info' noise by default
-    "nuclei_rate": 150,               # requests/sec — set from RoE
-    "nuclei_concurrency": 25,         # parallel templates
-    "nuclei_extra": [],               # e.g. ["-etags", "dos,intrusive"] to exclude
     "tools": {                        # override paths if not on $PATH
         "dnsx": "dnsx",
         "tlsx": "tlsx",
         "naabu": "naabu",
         "nmap": "nmap",
         "httpx": "httpx",
-        "nuclei": "nuclei",
     },
 }
 
@@ -129,14 +124,6 @@ CREATE TABLE IF NOT EXISTS web (
     server  TEXT,
     run_id  INTEGER NOT NULL,
     PRIMARY KEY (url, run_id)
-);
-CREATE TABLE IF NOT EXISTS findings (
-    matched_at  TEXT,
-    template_id TEXT,
-    name        TEXT,
-    severity    TEXT,
-    run_id      INTEGER NOT NULL,
-    PRIMARY KEY (matched_at, template_id, run_id)
 );
 """
 
@@ -229,14 +216,6 @@ class Store:
             (url, ip, port, status, title, tech, server, rid),
         )
 
-    def add_finding(self, matched_at, template_id, name, severity, rid):
-        self.db.execute(
-            "INSERT OR IGNORE INTO findings "
-            "(matched_at, template_id, name, severity, run_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (matched_at, template_id, name, severity, rid),
-        )
-
     def commit(self):
         self.db.commit()
 
@@ -256,12 +235,6 @@ class Store:
         ).fetchall()
         return [r["hostname"] for r in rows]
 
-    def web_urls_for_run(self, rid):
-        rows = self.db.execute(
-            "SELECT DISTINCT url FROM web WHERE run_id=?", (rid,)
-        ).fetchall()
-        return [r["url"] for r in rows]
-
 
 # --------------------------------------------------------------------------- #
 # Tool execution helpers
@@ -272,13 +245,13 @@ def have(tool):
 
 def run_tool(argv, outfile=None):
     """Run a tool; if outfile given, stream stdout into it. Returns rc."""
-    with open(outfile, "w") if outfile else subprocess.DEVNULL as fh:
+    if outfile:
+        with open(outfile, "w") as fh:
+            proc = subprocess.run(
+                argv, stdout=fh, stderr=subprocess.PIPE, text=True)
+    else:
         proc = subprocess.run(
-            argv,
-            stdout=fh if outfile else subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0 and proc.stderr:
         sys.stderr.write(f"[!] {argv[0]} stderr: {proc.stderr.strip()[:500]}\n")
     return proc.returncode
@@ -490,47 +463,12 @@ def stage_httpx(store, rid, wd, scope):
     return f"{n} web services"
 
 
-def stage_nuclei(store, rid, wd, scope):
-    """Templated vuln/misconfig checks against the web services httpx found.
-    Severity-filtered by default to keep 'info' noise out of the store."""
-    urls = store.web_urls_for_run(rid)
-    if not urls:
-        return "no web services to scan"
-
-    infile = os.path.join(wd, "nuclei_in.txt")
-    with open(infile, "w") as fh:
-        fh.write("\n".join(sorted(urls)))
-
-    out = os.path.join(wd, "nuclei.json")
-    argv = [CONFIG["tools"]["nuclei"], "-l", infile, "-jsonl", "-silent",
-            "-severity", CONFIG["nuclei_severity"],
-            "-rate-limit", str(CONFIG["nuclei_rate"]),
-            "-concurrency", str(CONFIG["nuclei_concurrency"]),
-            "-o", out] + CONFIG["nuclei_extra"]
-    run_tool(argv)
-
-    n = 0
-    for o in jsonl(out):
-        info = o.get("info", {}) or {}
-        store.add_finding(
-            first(o, "matched-at", "matched_at", "host"),
-            first(o, "template-id", "templateID", "template"),
-            first(info, "name"),
-            first(info, "severity", default="unknown"),
-            rid,
-        )
-        n += 1
-    store.commit()
-    return f"{n} findings"
-
-
 STAGE_FUNCS = {
     "dnsx": stage_dnsx,
     "tlsx": stage_tlsx,
     "naabu": stage_naabu,
     "nmap": stage_nmap,
     "httpx": stage_httpx,
-    "nuclei": stage_nuclei,
 }
 
 
@@ -625,19 +563,6 @@ def cmd_show(args):
             print(f"    {p['port']:>5}/tcp  {svc or '?'}")
         print()
 
-    findings = store.db.execute(
-        "SELECT severity, name, matched_at, template_id FROM findings "
-        "WHERE run_id=? ORDER BY CASE severity "
-        "WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 "
-        "WHEN 'low' THEN 3 ELSE 4 END",
-        (rid,)).fetchall()
-    if findings:
-        print("--- findings ---")
-        for f in findings:
-            sev = (f["severity"] or "?").upper()
-            print(f"    [{sev:>8}] {f['name']}  @ {f['matched_at']}  "
-                  f"({f['template_id']})")
-
 
 def cmd_diff(args):
     store = Store(CONFIG["db"])
@@ -656,20 +581,12 @@ def cmd_diff(args):
         return {(r["ip"], r["hostname"]) for r in store.db.execute(
             "SELECT ip, hostname FROM hostnames WHERE run_id=?", (rid,))}
 
-    def findingset(rid):
-        return {(r["matched_at"], f"{r['name']} [{r['severity']}]")
-                for r in store.db.execute(
-            "SELECT matched_at, name, severity FROM findings WHERE run_id=?",
-            (rid,))}
-
     op, np_ = portset(old), portset(new)
     on, nn = nameset(old), nameset(new)
-    of_, nf_ = findingset(old), findingset(new)
 
     for label, added, removed in [
         ("PORT", np_ - op, op - np_),
         ("NAME", nn - on, on - nn),
-        ("FIND", nf_ - of_, of_ - nf_),
     ]:
         for ip, val in sorted(added):
             print(f"  + {label}  {ip}  {val}")
@@ -690,7 +607,7 @@ def main():
 
     sub.add_parser("runs", help="list runs").set_defaults(func=cmd_runs)
 
-    s = sub.add_parser("show", help="dump a run's findings")
+    s = sub.add_parser("show", help="dump a run's results")
     s.add_argument("--run", type=int)
     s.set_defaults(func=cmd_show)
 
